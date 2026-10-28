@@ -1,0 +1,2 @@
+-- Tabla de pagos del Payment Mock (payment_key única).
+-- Se completa en el issue #2 (ver docs/estados.md para los valores de "estado").

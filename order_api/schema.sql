@@ -1,0 +1,2 @@
+-- Tablas de la Order API: productos, pedidos y reservas.
+-- Se completa en el issue #4 (ver docs/estados.md para los valores de "estado").
