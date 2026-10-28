@@ -43,6 +43,22 @@ def buscar_pago(conn, payment_key):
     ).fetchone()
 
 
+def devolver_existente(existente, pedido_id, monto, estado):
+    """Responde con el pago ya guardado; avisa en consola si la repetición trae otros datos."""
+    if (
+        existente["pedido_id"] != pedido_id
+        or existente["monto"] != float(monto)
+        or existente["estado"] != estado
+    ):
+        print(
+            f"[MOCK] AVISO: {existente['payment_key']} ya existía con otros datos "
+            f"(guardado: pedido {existente['pedido_id']}, monto {existente['monto']}, "
+            f"{existente['estado']}; recibido: pedido {pedido_id}, monto {float(monto)}, "
+            f"{estado}); se devuelve el pago original"
+        )
+    return jsonify(pago_a_dict(existente, nuevo=False)), 200
+
+
 def error(mensaje, codigo):
     return jsonify(error=mensaje), codigo
 
@@ -77,7 +93,7 @@ def crear_pago():
     try:
         existente = buscar_pago(conn, payment_key)
         if existente:
-            return jsonify(pago_a_dict(existente, nuevo=False)), 200
+            return devolver_existente(existente, pedido_id, monto, estado)
 
         try:
             conn.execute(
@@ -91,7 +107,7 @@ def crear_pago():
             # la restricción UNIQUE evitó la fila duplicada; devolvemos la ya guardada.
             conn.rollback()
             existente = buscar_pago(conn, payment_key)
-            return jsonify(pago_a_dict(existente, nuevo=False)), 200
+            return devolver_existente(existente, pedido_id, monto, estado)
 
         print(f"[MOCK] cobro {payment_key} registrado como {estado}")
         return jsonify(pago_a_dict(buscar_pago(conn, payment_key), nuevo=True)), 201
