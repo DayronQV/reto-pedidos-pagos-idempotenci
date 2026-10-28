@@ -39,7 +39,12 @@ Todas las respuestas son JSON. Los errores usan la forma `{"error": "mensaje"}`.
 |---|---|---|
 | **201** | `payment_key` nueva | El pago con `"nuevo": true` |
 | **200** | `payment_key` ya existía (no se inserta otra fila ni se vuelve a esperar) | El pago guardado con `"nuevo": false` |
-| **400** | Falta `payment_key`, `pedido_id` o `monto`, o `simular` no es válido | `{"error": "..."}` |
+| **400** | Falta `payment_key`, `pedido_id` o `monto`, `monto` no es mayor que 0, o `simular` no es válido | `{"error": "..."}` |
+
+Reglas del cuerpo:
+- `payment_key` (texto no vacío), `pedido_id` (entero) y `monto` (número **mayor que 0**) son obligatorios.
+- `simular` es opcional: si no llega, se usa `aprobado`.
+- Si la `payment_key` ya existe, se devuelve el pago original aunque el cuerpo traiga otro `monto`, `pedido_id` o `simular`; el mock solo avisa en consola.
 
 Ejemplo de respuesta **201**:
 ```json
