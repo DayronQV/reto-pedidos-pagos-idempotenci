@@ -5,18 +5,24 @@ Ejecutar:  python payment_mock/app.py   (puerto 5001 por defecto)
 """
 import os
 import sqlite3
+import time
 
 from flask import Flask, jsonify, request
 
 import db
 
 PORT = int(os.getenv("PAYMENT_MOCK_PORT", "5001"))
-# Cuánto tarda en responder cuando simula la respuesta perdida (issue #3).
+# Cuánto tarda en responder cuando simula la respuesta perdida (modo "timeout").
 # Debe ser mayor que PAYMENT_TIMEOUT_SECONDS de la Order API.
 MOCK_TIMEOUT_DELAY_SECONDS = float(os.getenv("MOCK_TIMEOUT_DELAY_SECONDS", "5"))
 
-# Resultado que se guarda según el valor de "simular" (el modo timeout llega en el issue #3).
-ESTADO_POR_SIMULACION = {"aprobado": "APROBADO", "rechazado": "RECHAZADO"}
+# Resultado que se guarda según el valor de "simular". En el modo timeout el cobro
+# queda APROBADO: lo que se pierde es la respuesta, no el cobro.
+ESTADO_POR_SIMULACION = {
+    "aprobado": "APROBADO",
+    "rechazado": "RECHAZADO",
+    "timeout": "APROBADO",
+}
 
 app = Flask(__name__)
 app.json.ensure_ascii = False  # respuestas JSON con tildes legibles
@@ -109,10 +115,20 @@ def crear_pago():
             existente = buscar_pago(conn, payment_key)
             return devolver_existente(existente, pedido_id, monto, estado)
 
-        print(f"[MOCK] cobro {payment_key} registrado como {estado}")
-        return jsonify(pago_a_dict(buscar_pago(conn, payment_key), nuevo=True)), 201
+        respuesta = pago_a_dict(buscar_pago(conn, payment_key), nuevo=True)
     finally:
         conn.close()
+
+    if simular == "timeout":
+        # El cobro ya está guardado y con commit: recién ahora se demora la respuesta.
+        print(
+            f"[MOCK] cobro {payment_key} registrado; "
+            f"simulando respuesta perdida ({MOCK_TIMEOUT_DELAY_SECONDS:g} s)"
+        )
+        time.sleep(MOCK_TIMEOUT_DELAY_SECONDS)
+    else:
+        print(f"[MOCK] cobro {payment_key} registrado como {estado}")
+    return jsonify(respuesta), 201
 
 
 @app.get("/payments/<payment_key>")
@@ -146,10 +162,6 @@ def reset():
     finally:
         conn.close()
     return jsonify(mensaje="pagos eliminados")
-
-
-# Rutas pendientes (ver docs/contrato-api.md):
-#   Modo "simular": "timeout" (guardar el cobro y luego demorar la respuesta) -> issue #3
 
 
 if __name__ == "__main__":
