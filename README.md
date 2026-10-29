@@ -146,6 +146,16 @@ Linux / macOS:
 
 **Comprobar que ambos responden:**
 
+Windows (PowerShell; allí `curl` es un alias de otro comando, por eso se usa `curl.exe`):
+```powershell
+curl.exe http://127.0.0.1:5001/health
+```
+
+```powershell
+curl.exe http://127.0.0.1:5000/health
+```
+
+Linux / macOS:
 ```bash
 curl http://127.0.0.1:5001/health
 ```
@@ -210,6 +220,7 @@ Las claves `Idempotency-Key` se generan solas en cada corrida, y la carpeta 0 re
 
 **Reiniciar los datos de prueba** (borra pedidos, reservas y pagos, y devuelve el stock a 10 y 1), con ambos servicios encendidos:
 
+Linux / macOS:
 ```bash
 curl -X POST http://127.0.0.1:5000/admin/reset
 ```
@@ -218,7 +229,16 @@ curl -X POST http://127.0.0.1:5000/admin/reset
 curl -X POST http://127.0.0.1:5001/admin/reset
 ```
 
-En PowerShell usar `curl.exe` en lugar de `curl` (`curl` es un alias de otro comando). Para empezar de cero del todo, apagar los servicios y borrar `order_api/orders.db` y `payment_mock/payments.db`; se crean de nuevo al arrancar.
+Windows (PowerShell):
+```powershell
+curl.exe -X POST http://127.0.0.1:5000/admin/reset
+```
+
+```powershell
+curl.exe -X POST http://127.0.0.1:5001/admin/reset
+```
+
+Para empezar de cero del todo, apagar los servicios y borrar `order_api/orders.db` y `payment_mock/payments.db`; se crean de nuevo al arrancar.
 
 **Ver lo que quedó guardado**, desde la raíz del repositorio (con los servicios encendidos o apagados):
 
@@ -237,7 +257,7 @@ El script usa solo `sqlite3` de Python, abre las bases en modo lectura e imprime
 - el total de pedidos, reservas y pagos, y cuántos hay en cada estado;
 - el stock actual de cada producto;
 - las `Idempotency-Key` y `payment_key` repetidas, que **debe salir vacío**;
-- el cruce de cada pedido con su pago por `payment_key` (cada pedido con cobro tiene exactamente 1 pago) y la coherencia entre el estado del pedido y el de su reserva.
+- el cruce de cada pedido con su pago por `payment_key` (cada pedido con cobro tiene exactamente 1 pago, y su estado coincide con el del pago: `PAGADO` con `APROBADO` y `RECHAZADO` con `RECHAZADO`) y la coherencia entre el estado del pedido y el de su reserva.
 
 Termina con `RESULTADO: correcto` (código de salida 0) o con `RESULTADO: revisar` (código 1) si encuentra algo.
 

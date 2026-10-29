@@ -9,6 +9,7 @@ Termina con código 0 si la evidencia es correcta y con 1 si encuentra algo que 
 import os
 import sqlite3
 import sys
+from pathlib import Path
 
 RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ORDERS_DB = os.path.join(RAIZ, "order_api", "orders.db")
@@ -23,7 +24,8 @@ def abrir(ruta):
     if not os.path.exists(ruta):
         print(f"No existe {os.path.relpath(ruta, RAIZ)}: arranca el servicio al menos una vez.")
         sys.exit(1)
-    conn = sqlite3.connect("file:" + ruta.replace("\\", "/") + "?mode=ro", uri=True)
+    # as_uri() codifica los caracteres especiales de la ruta (espacios, # o %).
+    conn = sqlite3.connect(Path(ruta).as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -96,11 +98,14 @@ def main():
     titulo("Cruce pedido - pago por payment_key")
     cobros = {f["payment_key"]: f["veces"] for f in payments.execute(
         "SELECT payment_key, COUNT(*) AS veces FROM pagos GROUP BY payment_key")}
+    estado_pago = {f["payment_key"]: f["estado"] for f in payments.execute(
+        "SELECT payment_key, estado FROM pagos")}
     pedidos = orders.execute(
         "SELECT id, idempotency_key, payment_key, estado FROM pedidos ORDER BY id").fetchall()
     cruce = [(p["id"], p["estado"], p["payment_key"] or "-",
-              cobros.get(p["payment_key"], 0) if p["payment_key"] else "-") for p in pedidos]
-    tabla(cruce, ("pedido", "estado", "payment_key", "pagos"))
+              cobros.get(p["payment_key"], 0) if p["payment_key"] else "-",
+              estado_pago.get(p["payment_key"], "-")) for p in pedidos]
+    tabla(cruce, ("pedido", "estado", "payment_key", "pagos", "estado del pago"))
     print()
     # Un pedido con cobro tiene exactamente 1 pago. Sin cobro solo puede estar en
     # SIN_STOCK (nunca llegó al mock) o en un estado sin resolver (PENDIENTE_PAGO).
@@ -110,6 +115,14 @@ def main():
     verificar("pedidos PAGADO o RECHAZADO sin pago en el mock", [
         (p["id"], p["estado"], p["payment_key"]) for p in pedidos
         if p["estado"] in ("PAGADO", "RECHAZADO") and cobros.get(p["payment_key"], 0) == 0])
+    # El estado final del pedido debe coincidir con el del pago: PAGADO <-> APROBADO y
+    # RECHAZADO <-> RECHAZADO.
+    pago_esperado = {"PAGADO": "APROBADO", "RECHAZADO": "RECHAZADO"}
+    verificar("pedidos cuyo estado no coincide con el estado de su pago", [
+        (p["id"], p["estado"], p["payment_key"], estado_pago[p["payment_key"]])
+        for p in pedidos
+        if p["estado"] in pago_esperado and p["payment_key"] in estado_pago
+        and estado_pago[p["payment_key"]] != pago_esperado[p["estado"]]])
     claves_pedidos = {p["payment_key"] for p in pedidos if p["payment_key"]}
     verificar("pagos sin pedido (huérfanos)", [
         (clave,) for clave in cobros if clave not in claves_pedidos])
