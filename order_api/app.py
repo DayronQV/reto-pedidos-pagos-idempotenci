@@ -135,7 +135,7 @@ def conciliar_pago_incierto(conn, pedido_id):
     del pedido. Aplica el resultado con procesar_resultado_pago (PAGADO o compensación).
 
     La usan POST /orders/<id>/reconciliar y la repetición de una Idempotency-Key cuyo
-    pedido está en PAGO_INCIERTO. Devuelve True si el pedido quedó resuelto (o ya era final)
+    pedido está en PAGO_INCIERTO o PENDIENTE_PAGO. Devuelve True si el pedido quedó resuelto (o ya era final)
     y False si el mock no respondió: en ese caso el pedido sigue en PAGO_INCIERTO.
     """
     pedido = conn.execute("SELECT * FROM pedidos WHERE id = ?", (pedido_id,)).fetchone()
@@ -155,19 +155,22 @@ def conciliar_pago_incierto(conn, pedido_id):
         print(f"[ORDER] el mock no respondió; el pedido {pedido_id} sigue incierto")
         return False
 
-    print(f"[ORDER] pago {payment_key} en el mock: {pago['estado']}")
+    print(f"[ORDER] pago {payment_key} en el mock: {pago.get('estado')}")
     return procesar_resultado_pago(conn, pedido_id, pago)
 
 
 def responder_repeticion(conn, existente, request_hash):
-    """Responde a una Idempotency-Key ya usada, sin tocar stock, reserva ni mock.
+    """Responde a una Idempotency-Key ya usada, sin crear pedido ni tocar stock ni reserva.
 
     Mismo cuerpo -> 200 con el pedido guardado e "idempotente": true.
     Otro cuerpo  -> 409.
+    Solo un pedido sin resolver (PAGO_INCIERTO, o PENDIENTE_PAGO si la Order API cayó o el
+    mock respondió con error después del commit) se concilia antes de responder; ahí sí se
+    consulta al mock, sin cobrar a ciegas. Un pedido en estado final no llama al mock.
     """
     if existente["request_hash"] != request_hash:
         return _error("la Idempotency-Key ya se usó con otra solicitud", 409)
-    if existente["estado"] == "PAGO_INCIERTO":
+    if existente["estado"] in ("PENDIENTE_PAGO", "PAGO_INCIERTO"):
         conciliar_pago_incierto(conn, existente["id"])
     pedido, reserva = _cargar_pedido(conn, existente["id"])
     return jsonify(_pedido_a_dict(pedido, reserva, idempotente=True)), 200
@@ -378,6 +381,9 @@ def crear_pedido():
             )
             pedido, reserva = _cargar_pedido(conn, pedido_id)
             respuesta = _pedido_a_dict(pedido, reserva)
+            if pedido["estado"] != "PAGO_INCIERTO":
+                # Otra conciliación lo resolvió mientras esta petición esperaba al mock.
+                return jsonify(respuesta), 201
             respuesta["mensaje"] = "pago en verificación"
             return jsonify(respuesta), 202
         except requests.RequestException:
