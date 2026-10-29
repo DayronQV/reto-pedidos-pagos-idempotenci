@@ -186,13 +186,56 @@ def crear_pedido_con_reserva(conn, idempotency_key, request_hash, producto, cant
     return pedido_id
 
 
+def compensar_pedido(conn, pedido_id):
+    """Libera la reserva del pedido, devuelve el stock y deja el pedido en RECHAZADO.
+
+    Todo en una sola transacción. El stock se devuelve solo si el UPDATE de la reserva
+    (RESERVADA -> LIBERADA) cambió 1 fila: llamarla otra vez sobre el mismo pedido no
+    encuentra reserva RESERVADA y no vuelve a sumar stock. Un pedido en estado final
+    (PAGADO, RECHAZADO, SIN_STOCK) no cambia.
+
+    La usan el rechazo del pago al crear el pedido y la conciliación de pagos (issue #7).
+    Devuelve True si en esta llamada liberó la reserva y devolvió el stock.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        reserva = conn.execute(
+            "SELECT producto_id, cantidad FROM reservas "
+            "WHERE pedido_id = ? AND estado = 'RESERVADA'",
+            (pedido_id,),
+        ).fetchone()
+        liberada = conn.execute(
+            "UPDATE reservas SET estado = 'LIBERADA', actualizado_en = datetime('now') "
+            "WHERE pedido_id = ? AND estado = 'RESERVADA'",
+            (pedido_id,),
+        ).rowcount == 1
+        if liberada:
+            conn.execute(
+                "UPDATE productos SET stock = stock + ? WHERE id = ?",
+                (reserva["cantidad"], reserva["producto_id"]),
+            )
+        conn.execute(
+            "UPDATE pedidos SET estado = 'RECHAZADO', actualizado_en = datetime('now') "
+            "WHERE id = ? AND estado IN ('PENDIENTE_PAGO', 'PAGO_INCIERTO')",
+            (pedido_id,),
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    return liberada
+
+
 def procesar_resultado_pago(conn, pedido_id, pago):
     """Aplica al pedido el resultado del pago que respondió el mock.
 
-    Hoy solo resuelve APROBADO: pedido PAGADO y reserva CONFIRMADA, en una transacción.
-    Devuelve True si lo aplicó. RECHAZADO (compensación, issue #8) y la conciliación de un
-    pago incierto (issue #7) se conectan aquí.
+    APROBADO: pedido PAGADO y reserva CONFIRMADA, en una transacción.
+    RECHAZADO: compensar_pedido (reserva LIBERADA, stock devuelto, pedido RECHAZADO).
+    Devuelve True si lo aplicó. La conciliación de un pago incierto (issue #7) se conecta aquí.
     """
+    if pago.get("estado") == "RECHAZADO":
+        compensar_pedido(conn, pedido_id)
+        return True
     if pago.get("estado") != "APROBADO":
         return False
     conn.execute("BEGIN IMMEDIATE")
@@ -291,7 +334,6 @@ def reiniciar_datos():
 
 # Rutas pendientes (ver docs/contrato-api.md):
 #   PAGO_INCIERTO y POST /orders/<id>/reconciliar                    -> issue #7
-#   Compensación cuando el pago es rechazado                         -> issue #8
 
 
 if __name__ == "__main__":
