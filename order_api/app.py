@@ -17,8 +17,11 @@ app.json.ensure_ascii = False  # respuestas JSON con tildes legibles
 db.init_db()
 
 
-def _pedido_a_dict(fila, reserva):
-    """Arma el pedido con el formato del contrato (sección POST /orders)."""
+def _pedido_a_dict(fila, reserva, idempotente=False):
+    """Arma el pedido con el formato del contrato (sección POST /orders).
+
+    idempotente=True se usa cuando la respuesta es la repetición de una solicitud.
+    """
     return {
         "id": fila["id"],
         "idempotency_key": fila["idempotency_key"],
@@ -32,7 +35,14 @@ def _pedido_a_dict(fila, reserva):
             if reserva
             else None
         ),
+        "idempotente": idempotente,
     }
+
+
+@app.errorhandler(404)
+def no_encontrado(_e):
+    # Rutas inexistentes (p. ej. GET /orders/abc) también responden JSON, como el contrato.
+    return jsonify(error="recurso no encontrado"), 404
 
 
 @app.get("/health")
