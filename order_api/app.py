@@ -135,8 +135,9 @@ def conciliar_pago_incierto(conn, pedido_id):
     del pedido. Aplica el resultado con procesar_resultado_pago (PAGADO o compensación).
 
     La usan POST /orders/<id>/reconciliar y la repetición de una Idempotency-Key cuyo
-    pedido está en PAGO_INCIERTO o PENDIENTE_PAGO. Devuelve True si el pedido quedó resuelto (o ya era final)
-    y False si el mock no respondió: en ese caso el pedido sigue en PAGO_INCIERTO.
+    pedido está en PAGO_INCIERTO o PENDIENTE_PAGO. Devuelve True si el pedido quedó
+    resuelto (o ya era final) y False si el mock no respondió: en ese caso el pedido
+    sigue como estaba (PAGO_INCIERTO o PENDIENTE_PAGO).
     """
     pedido = conn.execute("SELECT * FROM pedidos WHERE id = ?", (pedido_id,)).fetchone()
     if pedido["estado"] not in ("PENDIENTE_PAGO", "PAGO_INCIERTO"):
