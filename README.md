@@ -66,8 +66,10 @@ reto-pedidos-pagos-idempotenci/
 │   ├── app.py              # Rutas Flask del Payment Mock (puerto 5001)
 │   ├── db.py               # Conexión SQLite y creación de la tabla
 │   └── schema.sql          # Tabla: pagos
-├── postman/                # Colección de Postman exportada
-├── scripts/                # Script de evidencia SQLite
+├── postman/
+│   └── reto-pedidos-pagos.postman_collection.json   # Colección de Postman (v2.1)
+├── scripts/
+│   └── evidencia.py        # Informe de evidencia sobre las dos bases SQLite
 ├── docs/
 │   ├── estados.md          # Estados del pedido, la reserva y el pago
 │   └── contrato-api.md     # Endpoints, cuerpos y respuestas
@@ -192,4 +194,70 @@ Cuerpos, respuestas y códigos HTTP en [docs/contrato-api.md](docs/contrato-api.
 | 4. Pago rechazado | Forzar el rechazo | Pedido `RECHAZADO` y reserva liberada una sola vez |
 | 5. Otra intención de compra | Otra clave cuando queda una unidad | Se trata como operación distinta y el stock nunca queda negativo |
 
-La colección exportada estará en `postman/`.
+## Colección de Postman
+
+La colección está en `postman/reto-pedidos-pagos.postman_collection.json` (formato v2.1).
+
+1. Dejar **ambos servicios encendidos** (sección [Ejecución](#ejecución)).
+2. En Postman: **Import** y elegir el archivo anterior. Aparece la colección **Reto Pedidos Pagos Idempotencia** con las variables `order_url` (`http://127.0.0.1:5000`) y `payment_url` (`http://127.0.0.1:5001`). Si se cambió algún puerto, editarlas en la pestaña **Variables** de la colección.
+3. Clic derecho sobre la colección, **Run collection** y **Run** (Collection Runner).
+
+Se ejecutan las carpetas en orden: la **0** reinicia ambos servicios y deja el inventario inicial (producto 1 con stock 10 y producto 2 con stock 1); las **1 a 5** son los casos de la tabla anterior. Cada petición tiene pruebas (`pm.test`) sobre el código HTTP y el estado. Al terminar deben salir **24 peticiones y 25 verificaciones, todas en verde**. La carpeta 3 tarda unos 2 s porque simula el timeout.
+
+Las claves `Idempotency-Key` se generan solas en cada corrida, y la carpeta 0 reinicia los datos, así que la colección se puede ejecutar varias veces seguidas.
+
+## Reiniciar los datos y ver las bases
+
+**Reiniciar los datos de prueba** (borra pedidos, reservas y pagos, y devuelve el stock a 10 y 1), con ambos servicios encendidos:
+
+```bash
+curl -X POST http://127.0.0.1:5000/admin/reset
+```
+
+```bash
+curl -X POST http://127.0.0.1:5001/admin/reset
+```
+
+En PowerShell usar `curl.exe` en lugar de `curl` (`curl` es un alias de otro comando). Para empezar de cero del todo, apagar los servicios y borrar `order_api/orders.db` y `payment_mock/payments.db`; se crean de nuevo al arrancar.
+
+**Ver lo que quedó guardado**, desde la raíz del repositorio (con los servicios encendidos o apagados):
+
+Windows:
+```powershell
+.venv\Scripts\python scripts\evidencia.py
+```
+
+Linux / macOS:
+```bash
+.venv/bin/python scripts/evidencia.py
+```
+
+El script usa solo `sqlite3` de Python, abre las bases en modo lectura e imprime:
+
+- el total de pedidos, reservas y pagos, y cuántos hay en cada estado;
+- el stock actual de cada producto;
+- las `Idempotency-Key` y `payment_key` repetidas, que **debe salir vacío**;
+- el cruce de cada pedido con su pago por `payment_key` (cada pedido con cobro tiene exactamente 1 pago) y la coherencia entre el estado del pedido y el de su reserva.
+
+Termina con `RESULTADO: correcto` (código de salida 0) o con `RESULTADO: revisar` (código 1) si encuentra algo.
+
+## Prueba de reinicio
+
+Demuestra que los estados viven en SQLite y no en memoria: se deja un pedido en `PAGO_INCIERTO`, se apagan y encienden ambos servicios, y el pedido sigue consultable y se puede recuperar.
+
+1. Con ambos servicios encendidos, reiniciar los datos (sección anterior) y crear un pedido con timeout. Responde **202** con `PAGO_INCIERTO`:
+
+   Linux / macOS:
+   ```bash
+   curl -X POST http://127.0.0.1:5000/orders -H "Content-Type: application/json" -H "Idempotency-Key: reinicio-1" -d '{"producto_id": 1, "cantidad": 1, "simular_pago": "timeout"}'
+   ```
+
+   Windows (PowerShell):
+   ```powershell
+   Invoke-RestMethod -Method Post -Uri http://127.0.0.1:5000/orders -Headers @{"Idempotency-Key" = "reinicio-1"} -ContentType "application/json" -Body '{"producto_id": 1, "cantidad": 1, "simular_pago": "timeout"}'
+   ```
+
+2. **Apagar** ambos servicios (`Ctrl+C` en cada terminal) y **volver a encenderlos** con los comandos de la sección Ejecución.
+3. Comprobar que los estados siguen ahí: `GET http://127.0.0.1:5000/orders/1` sigue en `PAGO_INCIERTO` y `GET http://127.0.0.1:5001/payments/PAY-reinicio-1` muestra el cobro `APROBADO`.
+4. Recuperar el pedido consultando al mock (sin cobrar otra vez): `POST http://127.0.0.1:5000/orders/1/reconciliar` devuelve el pedido `PAGADO`. También se recupera reenviando el `POST /orders` con la misma `Idempotency-Key`.
+5. Ejecutar `scripts/evidencia.py`: hay 1 pedido `PAGADO`, 1 reserva `CONFIRMADA` y **1 solo pago** con `PAY-reinicio-1`.
