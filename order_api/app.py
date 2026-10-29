@@ -128,23 +128,50 @@ def _buscar_por_clave(conn, idempotency_key):
 
 
 def conciliar_pago_incierto(conn, pedido_id):
-    """Punto de enganche con la conciliación de pagos inciertos (issue #7).
+    """Averigua el estado real de un pago incierto consultando al Payment Mock.
 
-    Se llama al repetir una solicitud cuyo pedido está en PAGO_INCIERTO: en vez de devolverlo
-    tal cual, #7 consulta GET /payments/<payment_key> en el mock y deja el pedido en su
-    estado final. Mientras #7 no esté listo no hace nada y el pedido se devuelve como está.
+    Nunca cobra a ciegas: primero consulta GET /payments/<payment_key>. Solo si el mock
+    responde 404 (el cobro nunca se registró) reenvía el cobro, con la misma payment_key
+    del pedido. Aplica el resultado con procesar_resultado_pago (PAGADO o compensación).
+
+    La usan POST /orders/<id>/reconciliar y la repetición de una Idempotency-Key cuyo
+    pedido está en PAGO_INCIERTO o PENDIENTE_PAGO. Devuelve True si el pedido quedó
+    resuelto (o ya era final) y False si el mock no respondió: en ese caso el pedido
+    sigue como estaba (PAGO_INCIERTO o PENDIENTE_PAGO).
     """
+    pedido = conn.execute("SELECT * FROM pedidos WHERE id = ?", (pedido_id,)).fetchone()
+    if pedido["estado"] not in ("PENDIENTE_PAGO", "PAGO_INCIERTO"):
+        return True  # ya es final: no se hace nada
+
+    payment_key = pedido["payment_key"]
+    print(f"[ORDER] pedido {pedido_id} en {pedido['estado']}; consultando {payment_key}")
+    try:
+        pago = payment_client.consultar_pago(payment_key)
+        if pago is None:
+            print(f"[ORDER] el mock no tiene {payment_key}; reenviando el cobro con la misma clave")
+            pago = payment_client.crear_pago(
+                payment_key, pedido_id, pedido["monto"], pedido["simular_pago"]
+            )
+    except requests.RequestException:
+        print(f"[ORDER] el mock no respondió; el pedido {pedido_id} sigue incierto")
+        return False
+
+    print(f"[ORDER] pago {payment_key} en el mock: {pago.get('estado')}")
+    return procesar_resultado_pago(conn, pedido_id, pago)
 
 
 def responder_repeticion(conn, existente, request_hash):
-    """Responde a una Idempotency-Key ya usada, sin tocar stock, reserva ni mock.
+    """Responde a una Idempotency-Key ya usada, sin crear pedido ni tocar stock ni reserva.
 
     Mismo cuerpo -> 200 con el pedido guardado e "idempotente": true.
     Otro cuerpo  -> 409.
+    Solo un pedido sin resolver (PAGO_INCIERTO, o PENDIENTE_PAGO si la Order API cayó o el
+    mock respondió con error después del commit) se concilia antes de responder; ahí sí se
+    consulta al mock, sin cobrar a ciegas. Un pedido en estado final no llama al mock.
     """
     if existente["request_hash"] != request_hash:
         return _error("la Idempotency-Key ya se usó con otra solicitud", 409)
-    if existente["estado"] == "PAGO_INCIERTO":
+    if existente["estado"] in ("PENDIENTE_PAGO", "PAGO_INCIERTO"):
         conciliar_pago_incierto(conn, existente["id"])
     pedido, reserva = _cargar_pedido(conn, existente["id"])
     return jsonify(_pedido_a_dict(pedido, reserva, idempotente=True)), 200
@@ -231,7 +258,8 @@ def procesar_resultado_pago(conn, pedido_id, pago):
 
     APROBADO: pedido PAGADO y reserva CONFIRMADA, en una transacción.
     RECHAZADO: compensar_pedido (reserva LIBERADA, stock devuelto, pedido RECHAZADO).
-    Devuelve True si lo aplicó. La conciliación de un pago incierto (issue #7) se conecta aquí.
+    Sirve tanto para un pedido recién pagado como para uno que se concilió desde
+    PAGO_INCIERTO. Devuelve True si lo aplicó.
     """
     if pago.get("estado") == "RECHAZADO":
         compensar_pedido(conn, pedido_id)
@@ -242,7 +270,7 @@ def procesar_resultado_pago(conn, pedido_id, pago):
     try:
         conn.execute(
             "UPDATE pedidos SET estado = 'PAGADO', actualizado_en = datetime('now') "
-            "WHERE id = ? AND estado = 'PENDIENTE_PAGO'",
+            "WHERE id = ? AND estado IN ('PENDIENTE_PAGO', 'PAGO_INCIERTO')",
             (pedido_id,),
         )
         conn.execute(
@@ -255,6 +283,39 @@ def procesar_resultado_pago(conn, pedido_id, pago):
         conn.execute("ROLLBACK")
         raise
     return True
+
+
+def marcar_pago_incierto(conn, pedido_id):
+    """Pasa el pedido a PAGO_INCIERTO (la reserva sigue RESERVADA, no se toca el stock)."""
+    conn.execute(
+        "UPDATE pedidos SET estado = 'PAGO_INCIERTO', actualizado_en = datetime('now') "
+        "WHERE id = ? AND estado = 'PENDIENTE_PAGO'",
+        (pedido_id,),
+    )
+
+
+@app.post("/orders/<int:pedido_id>/reconciliar")
+def reconciliar_pedido(pedido_id):
+    """Recupera un pedido con pago incierto (ver conciliar_pago_incierto).
+
+    200 con el pedido resuelto (o tal cual si ya era final), 503 si el mock no responde y el
+    pedido sigue en PAGO_INCIERTO, 404 si el pedido no existe.
+    """
+    conn = db.get_connection()
+    conn.isolation_level = None  # transacciones manuales con BEGIN IMMEDIATE
+    try:
+        pedido, _reserva = _cargar_pedido(conn, pedido_id)
+        if pedido is None:
+            return _error("pedido no encontrado", 404)
+        resuelto = conciliar_pago_incierto(conn, pedido_id)
+        pedido, reserva = _cargar_pedido(conn, pedido_id)
+        respuesta = _pedido_a_dict(pedido, reserva)
+        if not resuelto:
+            respuesta["mensaje"] = "el Payment Mock no respondió; el pago sigue en verificación"
+            return jsonify(respuesta), 503
+        return jsonify(respuesta)
+    finally:
+        conn.close()
 
 
 @app.post("/orders")
@@ -311,8 +372,22 @@ def crear_pedido():
             pago = payment_client.crear_pago(
                 pedido["payment_key"], pedido_id, pedido["monto"], simular_pago
             )
+        except (requests.Timeout, requests.ConnectionError):
+            # No sabemos si el mock cobró: no se reintenta, se deja PAGO_INCIERTO y se
+            # averigua después consultando (POST /orders/<id>/reconciliar).
+            marcar_pago_incierto(conn, pedido_id)
+            print(
+                f"[ORDER] pedido {pedido_id} en PAGO_INCIERTO; "
+                f"hay que consultar {pedido['payment_key']}"
+            )
+            pedido, reserva = _cargar_pedido(conn, pedido_id)
+            respuesta = _pedido_a_dict(pedido, reserva)
+            if pedido["estado"] != "PAGO_INCIERTO":
+                # Otra conciliación lo resolvió mientras esta petición esperaba al mock.
+                return jsonify(respuesta), 201
+            respuesta["mensaje"] = "pago en verificación"
+            return jsonify(respuesta), 202
         except requests.RequestException:
-            # Timeout y recuperación: issue #7. Mientras tanto el pedido sigue PENDIENTE_PAGO.
             return _error("no se pudo confirmar el pago; el pedido quedó pendiente", 503)
 
         if not procesar_resultado_pago(conn, pedido_id, pago):
@@ -330,10 +405,6 @@ def crear_pedido():
 def reiniciar_datos():
     db.reset_db()
     return jsonify(mensaje="datos reiniciados")
-
-
-# Rutas pendientes (ver docs/contrato-api.md):
-#   PAGO_INCIERTO y POST /orders/<id>/reconciliar                    -> issue #7
 
 
 if __name__ == "__main__":
