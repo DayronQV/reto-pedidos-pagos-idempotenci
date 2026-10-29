@@ -5,6 +5,7 @@ Ejecutar:  python order_api/app.py   (puerto 5000 por defecto)
 import hashlib
 import json
 import os
+import sqlite3
 
 import requests
 from flask import Flask, jsonify, request
@@ -106,7 +107,7 @@ def _es_entero(valor):
 
 
 def _calcular_hash(producto_id, cantidad, simular_pago):
-    """Huella del cuerpo de la solicitud (la usará el issue #6 para detectar otro cuerpo)."""
+    """Huella del cuerpo de la solicitud: detecta la misma Idempotency-Key con otro cuerpo."""
     cuerpo = {"producto_id": producto_id, "cantidad": cantidad, "simular_pago": simular_pago}
     return hashlib.sha256(json.dumps(cuerpo, sort_keys=True).encode()).hexdigest()
 
@@ -117,6 +118,36 @@ def _cargar_pedido(conn, pedido_id):
         "SELECT * FROM reservas WHERE pedido_id = ?", (pedido_id,)
     ).fetchone()
     return pedido, reserva
+
+
+def _buscar_por_clave(conn, idempotency_key):
+    """Devuelve el pedido guardado con esa Idempotency-Key, o None si no existe."""
+    return conn.execute(
+        "SELECT * FROM pedidos WHERE idempotency_key = ?", (idempotency_key,)
+    ).fetchone()
+
+
+def conciliar_pago_incierto(conn, pedido_id):
+    """Punto de enganche con la conciliación de pagos inciertos (issue #7).
+
+    Se llama al repetir una solicitud cuyo pedido está en PAGO_INCIERTO: en vez de devolverlo
+    tal cual, #7 consulta GET /payments/<payment_key> en el mock y deja el pedido en su
+    estado final. Mientras #7 no esté listo no hace nada y el pedido se devuelve como está.
+    """
+
+
+def responder_repeticion(conn, existente, request_hash):
+    """Responde a una Idempotency-Key ya usada, sin tocar stock, reserva ni mock.
+
+    Mismo cuerpo -> 200 con el pedido guardado e "idempotente": true.
+    Otro cuerpo  -> 409.
+    """
+    if existente["request_hash"] != request_hash:
+        return _error("la Idempotency-Key ya se usó con otra solicitud", 409)
+    if existente["estado"] == "PAGO_INCIERTO":
+        conciliar_pago_incierto(conn, existente["id"])
+    pedido, reserva = _cargar_pedido(conn, existente["id"])
+    return jsonify(_pedido_a_dict(pedido, reserva, idempotente=True)), 200
 
 
 def crear_pedido_con_reserva(conn, idempotency_key, request_hash, producto, cantidad, simular_pago):
@@ -202,19 +233,32 @@ def crear_pedido():
     if simular_pago not in SIMULACIONES_VALIDAS:
         return _error("simular_pago debe ser: " + ", ".join(SIMULACIONES_VALIDAS), 400)
 
+    request_hash = _calcular_hash(producto_id, cantidad, simular_pago)
     conn = db.get_connection()
     conn.isolation_level = None  # transacciones manuales con BEGIN IMMEDIATE
     try:
+        # Antes de crear nada: si la clave ya se usó, es el mismo intento.
+        existente = _buscar_por_clave(conn, idempotency_key)
+        if existente is not None:
+            return responder_repeticion(conn, existente, request_hash)
+
         producto = conn.execute(
             "SELECT * FROM productos WHERE id = ?", (producto_id,)
         ).fetchone()
         if producto is None:
             return _error("producto no encontrado", 404)
 
-        pedido_id = crear_pedido_con_reserva(
-            conn, idempotency_key, _calcular_hash(producto_id, cantidad, simular_pago),
-            producto, cantidad, simular_pago,
-        )
+        try:
+            pedido_id = crear_pedido_con_reserva(
+                conn, idempotency_key, request_hash, producto, cantidad, simular_pago,
+            )
+        except sqlite3.IntegrityError:
+            # Otra petición con la misma clave se coló entre el SELECT y el INSERT: el UNIQUE
+            # frenó el duplicado y crear_pedido_con_reserva ya hizo rollback (el stock vuelve).
+            existente = _buscar_por_clave(conn, idempotency_key)
+            if existente is None:
+                raise
+            return responder_repeticion(conn, existente, request_hash)
         pedido, reserva = _cargar_pedido(conn, pedido_id)
         if pedido["estado"] == "SIN_STOCK":
             return jsonify(_pedido_a_dict(pedido, reserva)), 409
@@ -246,7 +290,6 @@ def reiniciar_datos():
 
 
 # Rutas pendientes (ver docs/contrato-api.md):
-#   Idempotency-Key en POST /orders                                  -> issue #6
 #   PAGO_INCIERTO y POST /orders/<id>/reconciliar                    -> issue #7
 #   Compensación cuando el pago es rechazado                         -> issue #8
 
