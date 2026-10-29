@@ -5,6 +5,7 @@ Ejecutar:  python order_api/app.py   (puerto 5000 por defecto)
 import hashlib
 import json
 import os
+import sqlite3
 
 import requests
 from flask import Flask, jsonify, request
@@ -106,7 +107,7 @@ def _es_entero(valor):
 
 
 def _calcular_hash(producto_id, cantidad, simular_pago):
-    """Huella del cuerpo de la solicitud (la usará el issue #6 para detectar otro cuerpo)."""
+    """Huella del cuerpo de la solicitud: detecta la misma Idempotency-Key con otro cuerpo."""
     cuerpo = {"producto_id": producto_id, "cantidad": cantidad, "simular_pago": simular_pago}
     return hashlib.sha256(json.dumps(cuerpo, sort_keys=True).encode()).hexdigest()
 
@@ -117,6 +118,59 @@ def _cargar_pedido(conn, pedido_id):
         "SELECT * FROM reservas WHERE pedido_id = ?", (pedido_id,)
     ).fetchone()
     return pedido, reserva
+
+
+def _buscar_por_clave(conn, idempotency_key):
+    """Devuelve el pedido guardado con esa Idempotency-Key, o None si no existe."""
+    return conn.execute(
+        "SELECT * FROM pedidos WHERE idempotency_key = ?", (idempotency_key,)
+    ).fetchone()
+
+
+def conciliar_pago_incierto(conn, pedido_id):
+    """Averigua el estado real de un pago incierto consultando al Payment Mock.
+
+    Nunca cobra a ciegas: primero consulta GET /payments/<payment_key>. Solo si el mock
+    responde 404 (el cobro nunca se registró) reenvía el cobro, con la misma payment_key
+    del pedido. Aplica el resultado con procesar_resultado_pago (PAGADO o compensación).
+
+    La usan POST /orders/<id>/reconciliar y la repetición de una Idempotency-Key cuyo
+    pedido está en PAGO_INCIERTO. Devuelve True si el pedido quedó resuelto (o ya era final)
+    y False si el mock no respondió: en ese caso el pedido sigue en PAGO_INCIERTO.
+    """
+    pedido = conn.execute("SELECT * FROM pedidos WHERE id = ?", (pedido_id,)).fetchone()
+    if pedido["estado"] not in ("PENDIENTE_PAGO", "PAGO_INCIERTO"):
+        return True  # ya es final: no se hace nada
+
+    payment_key = pedido["payment_key"]
+    print(f"[ORDER] pedido {pedido_id} en {pedido['estado']}; consultando {payment_key}")
+    try:
+        pago = payment_client.consultar_pago(payment_key)
+        if pago is None:
+            print(f"[ORDER] el mock no tiene {payment_key}; reenviando el cobro con la misma clave")
+            pago = payment_client.crear_pago(
+                payment_key, pedido_id, pedido["monto"], pedido["simular_pago"]
+            )
+    except requests.RequestException:
+        print(f"[ORDER] el mock no respondió; el pedido {pedido_id} sigue incierto")
+        return False
+
+    print(f"[ORDER] pago {payment_key} en el mock: {pago['estado']}")
+    return procesar_resultado_pago(conn, pedido_id, pago)
+
+
+def responder_repeticion(conn, existente, request_hash):
+    """Responde a una Idempotency-Key ya usada, sin tocar stock, reserva ni mock.
+
+    Mismo cuerpo -> 200 con el pedido guardado e "idempotente": true.
+    Otro cuerpo  -> 409.
+    """
+    if existente["request_hash"] != request_hash:
+        return _error("la Idempotency-Key ya se usó con otra solicitud", 409)
+    if existente["estado"] == "PAGO_INCIERTO":
+        conciliar_pago_incierto(conn, existente["id"])
+    pedido, reserva = _cargar_pedido(conn, existente["id"])
+    return jsonify(_pedido_a_dict(pedido, reserva, idempotente=True)), 200
 
 
 def crear_pedido_con_reserva(conn, idempotency_key, request_hash, producto, cantidad, simular_pago):
@@ -155,14 +209,57 @@ def crear_pedido_con_reserva(conn, idempotency_key, request_hash, producto, cant
     return pedido_id
 
 
+def compensar_pedido(conn, pedido_id):
+    """Libera la reserva del pedido, devuelve el stock y deja el pedido en RECHAZADO.
+
+    Todo en una sola transacción. El stock se devuelve solo si el UPDATE de la reserva
+    (RESERVADA -> LIBERADA) cambió 1 fila: llamarla otra vez sobre el mismo pedido no
+    encuentra reserva RESERVADA y no vuelve a sumar stock. Un pedido en estado final
+    (PAGADO, RECHAZADO, SIN_STOCK) no cambia.
+
+    La usan el rechazo del pago al crear el pedido y la conciliación de pagos (issue #7).
+    Devuelve True si en esta llamada liberó la reserva y devolvió el stock.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        reserva = conn.execute(
+            "SELECT producto_id, cantidad FROM reservas "
+            "WHERE pedido_id = ? AND estado = 'RESERVADA'",
+            (pedido_id,),
+        ).fetchone()
+        liberada = conn.execute(
+            "UPDATE reservas SET estado = 'LIBERADA', actualizado_en = datetime('now') "
+            "WHERE pedido_id = ? AND estado = 'RESERVADA'",
+            (pedido_id,),
+        ).rowcount == 1
+        if liberada:
+            conn.execute(
+                "UPDATE productos SET stock = stock + ? WHERE id = ?",
+                (reserva["cantidad"], reserva["producto_id"]),
+            )
+        conn.execute(
+            "UPDATE pedidos SET estado = 'RECHAZADO', actualizado_en = datetime('now') "
+            "WHERE id = ? AND estado IN ('PENDIENTE_PAGO', 'PAGO_INCIERTO')",
+            (pedido_id,),
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    return liberada
+
+
 def procesar_resultado_pago(conn, pedido_id, pago):
     """Aplica al pedido el resultado del pago que respondió el mock.
 
-    Hoy solo resuelve APROBADO: pedido PAGADO y reserva CONFIRMADA, en una transacción.
+    APROBADO: pedido PAGADO y reserva CONFIRMADA, en una transacción.
+    RECHAZADO: compensar_pedido (reserva LIBERADA, stock devuelto, pedido RECHAZADO).
     Sirve tanto para un pedido recién pagado como para uno que se concilió desde
-    PAGO_INCIERTO. Devuelve True si lo aplicó. RECHAZADO (compensación, issue #8) se
-    conecta aquí.
+    PAGO_INCIERTO. Devuelve True si lo aplicó.
     """
+    if pago.get("estado") == "RECHAZADO":
+        compensar_pedido(conn, pedido_id)
+        return True
     if pago.get("estado") != "APROBADO":
         return False
     conn.execute("BEGIN IMMEDIATE")
@@ -195,44 +292,24 @@ def marcar_pago_incierto(conn, pedido_id):
 
 @app.post("/orders/<int:pedido_id>/reconciliar")
 def reconciliar_pedido(pedido_id):
-    """Averigua el estado real de un pago incierto consultando al Payment Mock.
+    """Recupera un pedido con pago incierto (ver conciliar_pago_incierto).
 
-    Nunca cobra a ciegas: primero consulta. Solo si el mock responde 404 (el cobro nunca se
-    registró) reenvía el cobro, con la misma payment_key del pedido.
+    200 con el pedido resuelto (o tal cual si ya era final), 503 si el mock no responde y el
+    pedido sigue en PAGO_INCIERTO, 404 si el pedido no existe.
     """
     conn = db.get_connection()
     conn.isolation_level = None  # transacciones manuales con BEGIN IMMEDIATE
     try:
-        pedido, reserva = _cargar_pedido(conn, pedido_id)
+        pedido, _reserva = _cargar_pedido(conn, pedido_id)
         if pedido is None:
             return _error("pedido no encontrado", 404)
-        if pedido["estado"] not in ("PENDIENTE_PAGO", "PAGO_INCIERTO"):
-            return jsonify(_pedido_a_dict(pedido, reserva))  # ya es final: no se hace nada
-
-        payment_key = pedido["payment_key"]
-        print(f"[ORDER] pedido {pedido_id} en {pedido['estado']}; consultando {payment_key}")
-        try:
-            pago = payment_client.consultar_pago(payment_key)
-            if pago is None:
-                print(f"[ORDER] el mock no tiene {payment_key}; reenviando el cobro con la misma clave")
-                pago = payment_client.crear_pago(
-                    payment_key, pedido_id, pedido["monto"], pedido["simular_pago"]
-                )
-        except requests.RequestException:
-            print(f"[ORDER] el mock no respondió; el pedido {pedido_id} sigue incierto")
-            respuesta = _pedido_a_dict(pedido, reserva)
+        resuelto = conciliar_pago_incierto(conn, pedido_id)
+        pedido, reserva = _cargar_pedido(conn, pedido_id)
+        respuesta = _pedido_a_dict(pedido, reserva)
+        if not resuelto:
             respuesta["mensaje"] = "el Payment Mock no respondió; el pago sigue en verificación"
             return jsonify(respuesta), 503
-
-        print(f"[ORDER] pago {payment_key} en el mock: {pago['estado']}")
-        if not procesar_resultado_pago(conn, pedido_id, pago):
-            # RECHAZADO: la compensación (compensar_pedido) es del issue #8 y aún no está.
-            pedido, reserva = _cargar_pedido(conn, pedido_id)
-            respuesta = _pedido_a_dict(pedido, reserva)
-            respuesta["mensaje"] = "pago rechazado; compensación pendiente (issue #8)"
-            return jsonify(respuesta), 501
-        pedido, reserva = _cargar_pedido(conn, pedido_id)
-        return jsonify(_pedido_a_dict(pedido, reserva))
+        return jsonify(respuesta)
     finally:
         conn.close()
 
@@ -256,19 +333,32 @@ def crear_pedido():
     if simular_pago not in SIMULACIONES_VALIDAS:
         return _error("simular_pago debe ser: " + ", ".join(SIMULACIONES_VALIDAS), 400)
 
+    request_hash = _calcular_hash(producto_id, cantidad, simular_pago)
     conn = db.get_connection()
     conn.isolation_level = None  # transacciones manuales con BEGIN IMMEDIATE
     try:
+        # Antes de crear nada: si la clave ya se usó, es el mismo intento.
+        existente = _buscar_por_clave(conn, idempotency_key)
+        if existente is not None:
+            return responder_repeticion(conn, existente, request_hash)
+
         producto = conn.execute(
             "SELECT * FROM productos WHERE id = ?", (producto_id,)
         ).fetchone()
         if producto is None:
             return _error("producto no encontrado", 404)
 
-        pedido_id = crear_pedido_con_reserva(
-            conn, idempotency_key, _calcular_hash(producto_id, cantidad, simular_pago),
-            producto, cantidad, simular_pago,
-        )
+        try:
+            pedido_id = crear_pedido_con_reserva(
+                conn, idempotency_key, request_hash, producto, cantidad, simular_pago,
+            )
+        except sqlite3.IntegrityError:
+            # Otra petición con la misma clave se coló entre el SELECT y el INSERT: el UNIQUE
+            # frenó el duplicado y crear_pedido_con_reserva ya hizo rollback (el stock vuelve).
+            existente = _buscar_por_clave(conn, idempotency_key)
+            if existente is None:
+                raise
+            return responder_repeticion(conn, existente, request_hash)
         pedido, reserva = _cargar_pedido(conn, pedido_id)
         if pedido["estado"] == "SIN_STOCK":
             return jsonify(_pedido_a_dict(pedido, reserva)), 409
@@ -308,11 +398,6 @@ def crear_pedido():
 def reiniciar_datos():
     db.reset_db()
     return jsonify(mensaje="datos reiniciados")
-
-
-# Rutas pendientes (ver docs/contrato-api.md):
-#   Idempotency-Key en POST /orders                                  -> issue #6
-#   Compensación cuando el pago es rechazado                         -> issue #8
 
 
 if __name__ == "__main__":
