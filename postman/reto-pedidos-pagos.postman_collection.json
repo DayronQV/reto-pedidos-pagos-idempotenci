@@ -246,15 +246,6 @@
           "name": "Inventario antes",
           "event": [
             {
-              "listen": "prerequest",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "pm.collectionVariables.set(\"clave_caso2\", \"caso2-\" + Date.now());"
-                ]
-              }
-            },
-            {
               "listen": "test",
               "script": {
                 "type": "text/javascript",
@@ -285,6 +276,15 @@
         {
           "name": "Primer envío",
           "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set(\"clave_caso2\", \"caso2-\" + Date.now());"
+                ]
+              }
+            },
             {
               "listen": "test",
               "script": {
@@ -696,15 +696,6 @@
           "name": "Inventario antes",
           "event": [
             {
-              "listen": "prerequest",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "pm.collectionVariables.set(\"clave_caso4\", \"caso4-\" + Date.now());"
-                ]
-              }
-            },
-            {
               "listen": "test",
               "script": {
                 "type": "text/javascript",
@@ -735,6 +726,15 @@
         {
           "name": "Crear pedido (rechazado)",
           "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set(\"clave_caso4\", \"caso4-\" + Date.now());"
+                ]
+              }
+            },
             {
               "listen": "test",
               "script": {
@@ -781,6 +781,38 @@
                   "language": "json"
                 }
               }
+            }
+          }
+        },
+        {
+          "name": "Consultar el cobro en el mock",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 y cobro RECHAZADO\", () => {",
+                  "  const j = pm.response.json();",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(j.estado).to.eql(\"RECHAZADO\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{payment_url}}/payments/PAY-{{clave_caso4}}",
+              "host": [
+                "{{payment_url}}"
+              ],
+              "path": [
+                "payments",
+                "PAY-{{clave_caso4}}"
+              ]
             }
           }
         },
@@ -881,8 +913,7 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.collectionVariables.set(\"clave_caso5a\", \"caso5a-\" + Date.now());",
-                  "pm.collectionVariables.set(\"clave_caso5b\", \"caso5b-\" + Date.now());"
+                  "pm.collectionVariables.set(\"clave_caso5a\", \"caso5a-\" + Date.now());"
                 ]
               }
             },
@@ -937,6 +968,15 @@
         {
           "name": "Clave B (otra intención, sin stock)",
           "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set(\"clave_caso5b\", \"caso5b-\" + Date.now());"
+                ]
+              }
+            },
             {
               "listen": "test",
               "script": {
